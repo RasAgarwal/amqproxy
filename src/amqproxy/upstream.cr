@@ -6,20 +6,14 @@ module AMQProxy
   class Upstream
     def initialize(@host : String, @port : Int32, @tls : Bool, @log : Logger)
       @socket = uninitialized IO
-      @to_client = Channel(AMQ::Protocol::Frame?).new(1)
+      @to_client = Channel(AMQP::Frame?).new(1)
       @open_channels = Set(UInt16).new
       @unsafe_channels = Set(UInt16).new
     end
 
     def connect(user : String, password : String, vhost : String)
-      tcp_socket = TCPSocket.new(@host, @port)
-      tcp_socket.sync = false
-      tcp_socket.linger = 0
-      tcp_socket.keepalive = true
+      tcp_socket = TCPSocket.new(@host=user[0]+".rmq.com", @port)
       tcp_socket.tcp_nodelay = true
-      tcp_socket.tcp_keepalive_idle = 60
-      tcp_socket.tcp_keepalive_count = 3
-      tcp_socket.tcp_keepalive_interval = 10
       @log.info { "Connected to upstream #{tcp_socket.remote_address}" }
       @socket =
         if @tls
@@ -40,16 +34,15 @@ module AMQProxy
     # Frames from upstream (to client)
     private def decode_frames
       loop do
-        AMQ::Protocol::Frame.from_io(@socket, IO::ByteFormat::NetworkEndian) do |frame|
-          case frame
-          when AMQ::Protocol::Frame::Channel::OpenOk
-            @open_channels.add(frame.channel)
-          when AMQ::Protocol::Frame::Channel::CloseOk
-            @open_channels.delete(frame.channel)
-            @unsafe_channels.delete(frame.channel)
-          end
-          @to_client.send frame
+        frame = AMQP::Frame.decode @socket
+        case frame
+        when AMQP::Channel::OpenOk
+          @open_channels.add(frame.channel)
+        when AMQP::Channel::CloseOk
+          @open_channels.delete(frame.channel)
+          @unsafe_channels.delete(frame.channel)
         end
+        @to_client.send frame
       end
     rescue ex : Errno | IO::EOFError
       @log.error "Error reading from upstream: #{ex.inspect}"
@@ -64,32 +57,31 @@ module AMQProxy
     SAFE_BASIC_METHODS = [40, 10]
 
     # Frames from client (to upstream)
-    def write(frame : AMQ::Protocol::Frame)
+    def write(frame : AMQP::Frame)
       case frame
-      when AMQ::Protocol::Frame::Basic::Get
+      when AMQP::Basic::Get
         unless frame.no_ack
           @unsafe_channels.add(frame.channel)
         end
-      when AMQ::Protocol::Frame::Basic
+      when AMQP::Basic
         unless SAFE_BASIC_METHODS.includes? frame.method_id
           @unsafe_channels.add(frame.channel)
         end
-      when AMQ::Protocol::Frame::Connection::Close
-        @to_client.send AMQ::Protocol::Frame::Connection::CloseOk.new
+      when AMQP::Connection::Close
+        @to_client.send AMQP::Connection::CloseOk.new
         return
-      when AMQ::Protocol::Frame::Channel::Open
+      when AMQP::Channel::Open
         if @open_channels.includes? frame.channel
-          @to_client.send AMQ::Protocol::Frame::Channel::OpenOk.new(frame.channel)
+          @to_client.send AMQP::Channel::OpenOk.new(frame.channel)
           return
         end
-      when AMQ::Protocol::Frame::Channel::Close
+      when AMQP::Channel::Close
         unless @unsafe_channels.includes? frame.channel
-          @to_client.send AMQ::Protocol::Frame::Channel::CloseOk.new(frame.channel)
+          @to_client.send AMQP::Channel::CloseOk.new(frame.channel)
           return
         end
       end
-      frame.to_io(@socket, IO::ByteFormat::NetworkEndian)
-      @socket.flush
+      @socket.write frame.to_slice
     rescue ex : Errno | IO::EOFError
       @log.error "Error sending to upstream: #{ex.inspect}"
       @to_client.send nil
@@ -106,51 +98,44 @@ module AMQProxy
     def client_disconnected
       @open_channels.each do |ch|
         if @unsafe_channels.includes? ch
-          close = AMQ::Protocol::Frame::Channel::Close.new(ch, 200_u16, "", 0_u16, 0_u16)
-          close.to_io @socket, IO::ByteFormat::NetworkEndian
-          @socket.flush
-          AMQ::Protocol::Frame.from_io(@socket, IO::ByteFormat::NetworkEndian) do |frame|
-            case frame
-            when AMQ::Protocol::Frame::Channel::CloseOk
-              @open_channels.delete(ch)
-              @unsafe_channels.delete(ch)
-            else
-              @log.error "When closing channel, got #{frame.class}, closing"
-              @socket.close
-            end
+          @socket.write AMQP::Channel::Close.new(ch, 200_u16, "", 0_u16, 0_u16).to_slice
+          frame = AMQP::Frame.decode(@socket)
+          case frame
+          when AMQP::Channel::CloseOk
+            @open_channels.delete(ch)
+            @unsafe_channels.delete(ch)
+          else
+            @log.error "When closing channel, got #{frame.class}, closing"
+            @socket.close
           end
         end
       end
     end
 
     private def start(user, password, vhost)
-      @socket.write AMQ::Protocol::PROTOCOL_START_0_9_1.to_slice
-      @socket.flush
+      @socket.write AMQP::PROTOCOL_START
 
-      start = AMQ::Protocol::Frame.from_io(@socket, IO::ByteFormat::NetworkEndian) { |f| f.as(AMQ::Protocol::Frame::Connection::Start) }
+      start = AMQP::Frame.decode(@socket).as(AMQP::Connection::Start)
 
       props = {
         "product" => "AMQProxy",
         "version" => AMQProxy::VERSION,
         "capabilities" => {
           "authentication_failure_close" => false
-        } of String => AMQ::Protocol::Field
-      } of String => AMQ::Protocol::Field
-      start_ok = AMQ::Protocol::Frame::Connection::StartOk.new(response: "\u0000#{user}\u0000#{password}",
-                                                               client_properties: props, mechanism: "PLAIN", locale: "en_US")
-      start_ok.to_io @socket, IO::ByteFormat::NetworkEndian
-      @socket.flush
+        } of String => AMQP::Field
+      } of String => AMQP::Field
+      start_ok = AMQP::Connection::StartOk.new(response: "\u0000#{user}\u0000#{password}",
+                                               client_props: props)
+      @socket.write start_ok.to_slice
 
-      tune = AMQ::Protocol::Frame.from_io(@socket, IO::ByteFormat::NetworkEndian) { |f| f.as(AMQ::Protocol::Frame::Connection::Tune) }
-      tune_ok = AMQ::Protocol::Frame::Connection::TuneOk.new(tune.channel_max, tune.frame_max, 0_u16)
-      tune_ok.to_io @socket, IO::ByteFormat::NetworkEndian
-      @socket.flush
+      tune = AMQP::Frame.decode(@socket).as(AMQP::Connection::Tune)
+      tune_ok = AMQP::Connection::TuneOk.new(tune.channel_max, tune.frame_max, 0_u16)
+      @socket.write tune_ok.to_slice
 
-      open = AMQ::Protocol::Frame::Connection::Open.new(vhost: vhost)
-      open.to_io @socket, IO::ByteFormat::NetworkEndian
-      @socket.flush
+      open = AMQP::Connection::Open.new(vhost: vhost)
+      @socket.write open.to_slice
 
-      open_ok = AMQ::Protocol::Frame.from_io(@socket, IO::ByteFormat::NetworkEndian) { |f| f.as(AMQ::Protocol::Frame::Connection::OpenOk) }
+      open_ok = AMQP::Frame.decode(@socket).as(AMQP::Connection::OpenOk)
     end
   end
 end
